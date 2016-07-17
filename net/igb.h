@@ -168,10 +168,11 @@ struct igb_tx_buffer {
 	DEFINE_DMA_UNMAP_LEN(len);
 	u32 tx_flags;
 };
+
 struct igb_rx_buffer {
-	dma_addr_t dma;
+	dma_addr_t dma;   /**< page 对应的 DMA 物理地址. **/
 	struct page *page;
-	unsigned int page_offset;
+	unsigned int page_offset; /**< page 开始的索引. **/
 };
 struct igb_tx_queue_stats {
 	u64 packets;
@@ -194,6 +195,20 @@ struct igb_ring_container {
 	u8 count;			/* total number of rings in vector */
 	u8 itr;				/* current ITR setting for ring */
 };
+
+/*
+ * \struct
+ * ring 利用数组实现循环链表的功能.
+ * count 为链表长度.
+ * next_to_use 表示下一个可被内存分配索引
+ * next_to_clean 表示元素被清空的索引
+ * netx_to_alloc 同 next_to_use
+ * tail
+ * desc : 保持数据包的内存空间
+ *
+ * 从 next_to_use 到 next_to_clean 为可用区(分配内存)
+ *
+ */
 struct igb_ring {
 	struct igb_q_vector *q_vector;	/* backlink to q_vector */
 	struct net_device *netdev;	/* back pointer to net_device 等于 adapter->netdev*/
@@ -207,13 +222,13 @@ struct igb_ring {
 	void __iomem *tail;		/* pointer to ring tail register */
 	dma_addr_t dma;			/* phys address of the ring */
 	unsigned int  size;		/* length of desc. ring in bytes */
-	u16 count;			/* number of desc. in the ring    adapter->rx_ring_count 或 adapter->tx_ring_count*/
+	u16 count;			/* number of desc. in the ring.  默认 256 */
 	u8 queue_index;			/* logical index of the ring*/
 	u8 reg_idx;			/* physical index of the ring, 以 adapter->vfs_allocated_count 为起点 */
 	/* everything past this point are written often */
-	u16 next_to_clean;
-	u16 next_to_use;
-	u16 next_to_alloc;
+	u16 next_to_clean;  /* */
+	u16 next_to_use;    /* 下次分配 rx_buffer_info(tx_buffer_info) 时开始的索引 */
+	u16 next_to_alloc;  /* 下次分配 rx_buffer_info(tx_buffer_info) 时开始的索引 */
 	union {
 		/* TX */
 		struct {
@@ -223,7 +238,7 @@ struct igb_ring {
 		};
 		/* RX */
 		struct {
-			struct sk_buff *skb;
+			struct sk_buff *skb; //
 			struct igb_rx_queue_stats rx_stats;
 			struct u64_stats_sync rx_syncp;
 		};
@@ -263,6 +278,9 @@ static inline __le32 igb_test_staterr(union e1000_adv_rx_desc *rx_desc,
 	return rx_desc->wb.upper.status_error & cpu_to_le32(stat_err_bits);
 }
 /* igb_desc_unused - calculate if we have unused descriptors */
+/**
+ * 返回没有用的 igb_ring->desc 的个数
+ */
 static inline int igb_desc_unused(struct igb_ring *ring)
 {
 	if (ring->next_to_clean > ring->next_to_use)

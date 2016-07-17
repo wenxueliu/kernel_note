@@ -2312,6 +2312,13 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_enable_pcie_error_reporting(pdev);
 
+    /*
+     * Enable DMA by setting the bus master bit in the PCI_COMMAND register.
+     * The device will then be able to act as a master on the address bus.
+     *
+     * pdev->is_busmaster = true
+     * PCI_COMMAND 寄存器打开 PCI_COMMAND_MASTER 开关
+     */
 	pci_set_master(pdev);
 	pci_save_state(pdev);
 
@@ -5719,6 +5726,7 @@ static irqreturn_t igb_msix_ring(int irq, void *data)
 	struct igb_q_vector *q_vector = data;
 
 	/* Write the ITR value calculated from the previous interrupt. */
+    /* 写 ITR(Interrupt Throttling) 值到之前的中断*/
 	igb_write_itr(q_vector);
 
 	napi_schedule(&q_vector->napi);
@@ -6812,6 +6820,16 @@ static bool igb_can_reuse_rx_page(struct igb_rx_buffer *rx_buffer,
  *
  *  The function will then update the page offset if necessary and return
  *  true if the buffer can be reused by the adapter.
+ *
+ *  将 rx_buffer->page 拷贝到 skb 后面(大小为 rx_desc->wb.upper.length)
+ *  并初始化 skb.
+ *
+ *  1. 当 skb->data_len 不为空, 将 rx_buffer->page 加入 skb->nr_frags
+ *  2. 当 skb->data_len 为空, rx_desc->wb.upper.length 小于等于 IGB_RX_HDR_LEN,
+ *  并将 rx_buffer->page 加入 skb->data
+ *  3. 当 skb->data_len 为空, rx_desc->wb.upper.length 大于 IGB_RX_HDR_LEN,
+ *  并将 rx_buffer->page 加入 skb->data, 与 2 页码对其不一样.
+ *
  **/
 static bool igb_add_rx_frag(struct igb_ring *rx_ring,
 			    struct igb_rx_buffer *rx_buffer,
@@ -6862,12 +6880,32 @@ static bool igb_add_rx_frag(struct igb_ring *rx_ring,
 	size -= pull_len;
 
 add_tail_frag:
+    /*
+     * 将 page 加入 skb 的 flags 中.
+     *
+     * frag = skb_shinfo(skb)->frags[skb_shinfo(skb)->nr_frags]
+     * frag->page.p = page
+     * frag->page_offset = page
+     * frag->size = size
+     * skb_shinfo(skb)->n_frags += 1
+     * skb->len += size
+     * skb->data_len += size
+     * skb->truesize
+     */
 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
 			(unsigned long)va & ~PAGE_MASK, size, truesize);
 
 	return igb_can_reuse_rx_page(rx_buffer, page, truesize);
 }
 
+/**
+ * \brief 将 rx_buffer->page 拷贝到 skb
+ *
+ * 1. 如果 skb 为空, 为 skb 分配空间.
+ * 2. 将 rx_buffer->page 拷贝到 skb 后面(大小为 rx_desc->wb.upper.length)
+ *  并初始化 skb.
+ * 3. rx_buffer->page = NULL
+ */
 static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 					   union e1000_adv_rx_desc *rx_desc,
 					   struct sk_buff *skb)
@@ -6890,6 +6928,7 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 #endif
 
 		/* allocate a skb to store the frags */
+        //为 skb 分配空间, skb->dev = rx_ring->q_vector->napi->dev
 		skb = napi_alloc_skb(&rx_ring->q_vector->napi, IGB_RX_HDR_LEN);
 		if (unlikely(!skb)) {
 			rx_ring->rx_stats.alloc_failed++;
@@ -6904,6 +6943,7 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 	}
 
 	/* we are reusing so sync this buffer for CPU use */
+    /* TODO */
 	dma_sync_single_range_for_cpu(rx_ring->dev,
 				      rx_buffer->dma,
 				      rx_buffer->page_offset,
@@ -6911,6 +6951,10 @@ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
 				      DMA_FROM_DEVICE);
 
 	/* pull page into skb */
+    /*
+     *  将 rx_buffer->page 拷贝到 skb 后面(大小为 rx_desc->wb.upper.length)
+     *  并初始化 skb.
+     * */
 	if (igb_add_rx_frag(rx_ring, rx_buffer, rx_desc, skb)) {
 		/* hand second half of page back to the ring */
 		igb_reuse_rx_page(rx_ring, rx_buffer);
@@ -7054,6 +7098,11 @@ static void igb_process_skb_fields(struct igb_ring *rx_ring,
 {
 	struct net_device *dev = rx_ring->netdev;
 
+    /*
+     * skb->l4_hash = fale
+     * skb->sw_hash = false
+     * skb->hash = rx_desc->wb.lower.hi_dword.rss
+     */
 	igb_rx_hash(rx_ring, rx_desc, skb);
 
 	igb_rx_checksum(rx_ring, rx_desc, skb);
@@ -7075,11 +7124,21 @@ static void igb_process_skb_fields(struct igb_ring *rx_ring,
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 	}
 
+    //skb->queue_mapping = rx_ring->queue_index + 1
 	skb_record_rx_queue(skb, rx_ring->queue_index);
 
 	skb->protocol = eth_type_trans(skb, rx_ring->netdev);
 }
 
+/**
+ * \brief 从 ring 中取最多 budget 包拷贝到 skb 并更新状态.
+ *
+ * 1. 从 rx_ring 找到没有使用的 desc 数量 size. 如果 size 大于 IGB_RX_BUFFER_WRITE,
+ * 就为可用的 rx_buffer_info 分配 size 个内存页.
+ * 2. 为 rx_ring buffer_info 分配 cleaned_count 新的空间, 并更新对应成员.
+ * 3. 将数据包从 rx_ring->tx_buffer_info->page 拷贝到 skb 后面(data 或 flags)
+ * 4. 将 skb 传递给网络协议栈
+ */
 static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 {
 	struct igb_ring *rx_ring = q_vector->rx.ring;
@@ -7092,6 +7151,7 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 
 		/* return some buffers to hardware, one at a time is too slow */
 		if (cleaned_count >= IGB_RX_BUFFER_WRITE) {
+            //分配 cleaned_count 个 rx_buffer_info 给 rx_ring.
 			igb_alloc_rx_buffers(rx_ring, cleaned_count);
 			cleaned_count = 0;
 		}
@@ -7108,6 +7168,7 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 		dma_rmb();
 
 		/* retrieve a buffer from the ring */
+        /* 将 rx_buffer->page 拷贝到 skb */
 		skb = igb_fetch_rx_buffer(rx_ring, rx_desc, skb);
 
 		/* exit if we failed to retrieve a buffer */
@@ -7117,6 +7178,10 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 		cleaned_count++;
 
 		/* fetch next buffer in frame if non-eop */
+        /*
+         * 修正 rx_ring->next_to_clean, 并检查 rx_desc->wb.upper.status_error
+         * 是否到达包结束标志.
+         */
 		if (igb_is_non_eop(rx_ring, rx_desc))
 			continue;
 
@@ -7130,8 +7195,23 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 		total_bytes += skb->len;
 
 		/* populate checksum, timestamp, VLAN, and protocol */
+        /*
+         * 计算 skb 相关 hash 属性
+         * 校验 checksum
+         * 设置 skb->protocol
+         *
+         * skb->l4_hash = fale
+         * skb->sw_hash = false
+         * skb->hash = rx_desc->wb.lower.hi_dword.rss
+         * skb->protocol
+         * skb->queue_mapping = rx_ring->queue_index + 1
+         *
+         */
 		igb_process_skb_fields(rx_ring, rx_desc, skb);
 
+        /*
+         * TODO
+         */
 		napi_gro_receive(&q_vector->napi, skb);
 
 		/* reset skb pointer */
@@ -7157,6 +7237,13 @@ static int igb_clean_rx_irq(struct igb_q_vector *q_vector, const int budget)
 	return total_packets;
 }
 
+/**
+ * \brief 为 igb_ring->rx_buffer_info 分配空间, 并初始化.
+ *
+ * 如果 bi->page 为空, 为 bi->page 分配空间, 并初始化 bi, 返回 true
+ * 如果分配 bi->page 不为空, 返回 true
+ * 分配空间失败, 返回 false.
+ */
 static bool igb_alloc_mapped_page(struct igb_ring *rx_ring,
 				  struct igb_rx_buffer *bi)
 {
@@ -7197,6 +7284,13 @@ static bool igb_alloc_mapped_page(struct igb_ring *rx_ring,
 /**
  *  igb_alloc_rx_buffers - Replace used receive buffers; packet split
  *  @adapter: address of board private structure
+ *
+ *  \brief 为 rx_ring buffer_info 分配 cleaned_count 新的空间, 并更新
+ *  对应成员.
+ *
+ *  从 igb_ring->next_to_use 开始 igb_ring 分配 cleaned_count 个
+ *  rx_buffer_info, 并更新 rx_ring 的 rx_desc->pkt_addr, next_to_use,
+ *  next_to_alloc, tail
  **/
 void igb_alloc_rx_buffers(struct igb_ring *rx_ring, u16 cleaned_count)
 {
@@ -7213,6 +7307,11 @@ void igb_alloc_rx_buffers(struct igb_ring *rx_ring, u16 cleaned_count)
 	i -= rx_ring->count;
 
 	do {
+        /*
+         * 如果 bi->page 为空, 为 bi->page 分配空间, 并初始化 bi, 返回 true
+         * 如果分配 bi->page 不为空, 返回 true
+         * 分配空间失败, 返回 false.
+         */
 		if (!igb_alloc_mapped_page(rx_ring, bi))
 			break;
 
