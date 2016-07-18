@@ -142,6 +142,48 @@
 
 #include "net-sysfs.h"
 
+/**
+ *
+ * offload_base 是由一系列具有不同 priority 的 packet_offload 链表组成.
+ * 即 offload_base 每个元素是链表, 该链表的的元素的 priority 相同. 但是
+ * 不同元素的链表直接的 priority 不同. 也可以理解为 将 packet_offload 以
+ * priority 不同组成不同的链表.
+ *
+ * 目前包含的元素
+ *
+ * ethernet : eth_packet_offload
+ * ipv4     : ip_packet_offload
+ * ipv6     : ipv6_packet_offload
+ * mpls     : mpls_uc_offload, mpls_mc_offload
+ * vlan     : vlan_packet_offloads[]
+ *
+ * struct packet_offload {
+ *   __be16			 type;	// This is really htons(ether_type).
+ *   u16			 priority;
+ *   struct offload_callbacks callbacks;
+ *   struct list_head	 list;
+ * };
+ *
+ * static struct packet_offload ip_packet_offload __read_mostly = {
+ *  .type = cpu_to_be16(ETH_P_IP),
+ *  .callbacks = {
+ *  	.gso_segment = inet_gso_segment,
+ *  	.gro_receive = inet_gro_receive,
+ *  	.gro_complete = inet_gro_complete,
+ *  },
+ *
+ * static struct packet_offload eth_packet_offload __read_mostly = {
+ *   .type = cpu_to_be16(ETH_P_TEB),
+ *   .priority = 10,
+ *   .callbacks = {
+ *   	.gro_receive = eth_gro_receive,
+ *   	.gro_complete = eth_gro_complete,
+ * },
+};
+ *
+};
+ */
+
 /* Instead of increasing this, you should create a hash table. */
 #define MAX_GRO_SKBS 8
 
@@ -473,6 +515,8 @@ EXPORT_SYMBOL(dev_remove_pack);
  *      This call does not sleep therefore it can not
  *      guarantee all CPU's that are in middle of receiving packets
  *      will see the new offload handlers (until the next received packet).
+ *
+ *      增加 po 到 offload_base 中与其 priority 相同的 list 中
  */
 void dev_add_offload(struct packet_offload *po)
 {
@@ -3441,6 +3485,19 @@ EXPORT_SYMBOL(rps_cpu_mask);
 
 struct static_key rps_needed __read_mostly;
 
+/*
+ * 如果 RFS 特性打开:
+ *  rxq_index = cpu_rmap_lookup_index(dev->rx_cpu_rmap, next_cpu);
+ *  flow_table = (dev->_rx + rxq_index)->rps_flow_table
+ *  rflow = flow_table->flow[skb->hash & flow_table->mask]
+ *  rflow->filter =  dev->netdev_ops->ndo_rx_flow_steer(dev, skb, rxq_index, skb->hash & flow_table->mask);
+ *  rflow->cpu = next_cpu
+ *
+ * 否则
+ *
+ *  rflow->last_qtail 为 next_cpu 对应的 softnet_data->input_queue_head
+ *  rflow->cpu = next_cpu
+ */
 static struct rps_dev_flow *
 set_rps_cpu(struct net_device *dev, struct sk_buff *skb,
             struct rps_dev_flow *rflow, u16 next_cpu)
@@ -3490,6 +3547,22 @@ set_rps_cpu(struct net_device *dev, struct sk_buff *skb,
  * get_rps_cpu is called from netif_receive_skb and returns the target
  * CPU from the RPS map of the receiving queue for a given skb.
  * rcu_read_lock must be held on entry.
+ *
+ *  根据 skb->hash 获取 rps 应该将 skb 分配的 cpu id.
+ *
+ *  1. 如果 rps_sock_flow_table 和  dev->_rx->rps_flow_table 中 skb->hash
+ *  对应的 cpu 是同一 cpu, 返回该 cpu, 并将 rflowp 设置为
+ *  dev->_rx->rps_flow_table->flows[skb->hash & flow_table->mask]
+ *
+ *  2. 如果 rps_sock_flow_table 和  dev->_rx->rps_flow_table 中 skb->hash
+ *  对应的 cpu 不是同一 cpu, 但是 dev->_rx->rps_flow_table 对应的上一条流
+ *  已经不在 rps_sock_flow_table 对应的 CPU 上, 设置 cpu 以 rps_sock_flow_table
+ *  哈希后的 cpu 为主. 其中 rflowp 分配参考 set_rps_cpu.
+ *
+ *  3. 如果 rps_sock_flow_table 或 dev->_rx->rps_flow_table 为空,
+ *  cpu 为 rxqueue->rps_map->cpus[(skb->hash * map) >> 32]
+ *
+ *
  */
 static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb,
                        struct rps_dev_flow **rflowp)
@@ -3502,6 +3575,9 @@ static int get_rps_cpu(struct net_device *dev, struct sk_buff *skb,
         u32 tcpu;
         u32 hash;
 
+        /*
+         * 找到 skb 在 dev->_rx 中对应的接受队列
+         */
         if (skb_rx_queue_recorded(skb)) {
                 u16 index = skb_get_rx_queue(skb);
 
@@ -3698,9 +3774,20 @@ static bool skb_flow_limit(struct sk_buff *skb, unsigned int qlen)
         return false;
 }
 
-/*
+/**
  * enqueue_to_backlog is called to queue an skb to a per CPU backlog
  * queue (may be a remote CPU queue).
+ *
+ *
+ * \brief 将 skb 加入 cpu 对应的 softnet_data->input_pkt_queue
+ *
+ * 如果 cpu 对应的 softnet_data->input_pkt_queue 没有超过 netdev_max_backlog,
+ * 并且 flow_limit 也没有达到, skb 对应的 dev 也在运行, 将 skb 加入
+ * softnet_data->input_pkt_queue.
+ *
+ * 否则, 丢弃包.
+ *
+ * 注: 如果 softnet_data->input_pkt_queue 为空, 设置 NAPI_STATE_SCHED, 收包.
  */
 static int enqueue_to_backlog(struct sk_buff *skb, int cpu,
                               unsigned int *qtail)
@@ -4226,6 +4313,7 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
 #ifdef CONFIG_RPS
         if (static_key_false(&rps_needed)) {
                 struct rps_dev_flow voidflow, *rflow = &voidflow;
+                //根据 skb->hash 获取 rps 应该将 skb 分配的 cpu id.
                 int cpu = get_rps_cpu(skb->dev, skb, &rflow);
 
                 if (cpu >= 0) {
@@ -4291,6 +4379,11 @@ static void flush_backlog(void *arg)
         }
 }
 
+/*
+ * 遍历 offload_base 每个元素调用其 callbacks.gro_complete 方法,
+ * 之后将 skb 传递到协议栈
+ *
+ */
 static int napi_gro_complete(struct sk_buff *skb)
 {
         struct packet_offload *ptype;
@@ -4354,6 +4447,14 @@ void napi_gro_flush(struct napi_struct *napi, bool flush_old)
 }
 EXPORT_SYMBOL(napi_gro_flush);
 
+/**
+ * \brief 比较 napi->gro_list 的每个元素与 skb 的 hash, maclen, tci 等决定是否两个 skb 属于同一流,
+ * 并设置 same_flow 属性same_flow 属性
+ *
+ * 对于 napi->gro_list 每个元素:
+ * 如果与 skb 相同, 设置 same_flow 为 1
+ * 如果与 skb 不同, 设置 same_flow 为 0
+ */
 static void gro_list_prepare(struct napi_struct *napi, struct sk_buff *skb)
 {
         struct sk_buff *p;
@@ -4438,6 +4539,10 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff 
         if (skb_is_gso(skb) || skb_has_frag_list(skb) || skb->csum_bad)
                 goto normal;
 
+        /*
+         * \brief 比较 napi->gro_list 的每个元素与 skb 的 hash, maclen, tci 等决定是否两个 skb 属于同一流,
+         * 并设置 same_flow 属性same_flow 属性
+         */
         gro_list_prepare(napi, skb);
 
         rcu_read_lock();

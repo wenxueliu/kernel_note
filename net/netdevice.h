@@ -1752,9 +1752,9 @@ struct tc_to_netdev {
          unsigned char           *dev_addr;
  
  #ifdef CONFIG_SYSFS
-         struct netdev_rx_queue  *_rx;
+         struct netdev_rx_queue  *_rx;              /**< 接受队列 */
  
-         unsigned int            num_rx_queues;
+         unsigned int            num_rx_queues;     /**< 接受队列数量 */
          unsigned int            real_num_rx_queues;
  #endif
  
@@ -2751,10 +2751,10 @@ struct tc_to_netdev {
          struct sk_buff_head     process_queue;
  
          /* stats */
-         unsigned int            processed;
-         unsigned int            time_squeeze;
-         unsigned int            cpu_collision;
-         unsigned int            received_rps;
+         unsigned int            processed;     /**< 当前 CPU 处理的网络帧 */
+         unsigned int            time_squeeze;  /**< net_rx_action 执行的次数.(与硬件中断和软件中断的关系?), 增加 budget 可以减少该值. */
+         unsigned int            cpu_collision; /**< 传输数据时, 由于获得锁失败的次数 */
+         unsigned int            received_rps;  /**< CPU 被唤醒取处理包的次数(由于 Inter-processor 中断)*/
  #ifdef CONFIG_RPS
          struct softnet_data     *rps_ipi_list;
  #endif
@@ -2771,10 +2771,10 @@ struct tc_to_netdev {
          struct softnet_data     *rps_ipi_next;
          unsigned int            cpu;
          unsigned int            input_queue_head;
-         unsigned int            input_queue_tail;
+         unsigned int            input_queue_tail;  /**< 记录 input_pkt_queue 的尾部索引 */
  #endif
-         unsigned int            dropped;
-         struct sk_buff_head     input_pkt_queue;
+         unsigned int            dropped;  /**< 由于队列满导致丢掉的网络帧*/
+         struct sk_buff_head     input_pkt_queue; /**< 保持收到的 skb */
          struct napi_struct      backlog;
  
  };
