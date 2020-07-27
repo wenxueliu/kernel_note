@@ -93,6 +93,7 @@ struct task_struct {
 ```
 
 
+![process_slibing.jpeg](process_slibing.jpeg)
 
 <img src="process_slibing.jpeg" alt="process slibing" style="zoom:20%;" />
 
@@ -235,6 +236,8 @@ struct cred {
 
 suid/sgid 可以用来保存 id, 进程可以通过 setuid 更改 uid
 
+![process_suid.jpeg](process_suid.jpeg)
+
 <img src="process_suid.jpeg" alt="process_suid" style="zoom:20%;" />
 
 ### capabilities 机制
@@ -254,6 +257,8 @@ cap_ambient exec 时, 并入 cap_permitted 和 cap_effective 中
 在用户态，应用程序进行了至少一次函数调用。32 位和 64 的传递参数的方式稍有不同，32 位的就是用函数栈，64 位的前 6 个参数用寄存器，其他的用函数栈。
 
 在内核态，32 位和 64 位都使用内核栈，格式也稍有不同，主要集中在 pt_regs 结构上。在内核态，32 位和 64 位的内核栈和 task_struct 的关联关系不同。32 位主要靠 thread_info，64 位主要靠 Per-CPU 变量。
+
+![process_stack.jpeg](process_stack.jpeg)
 
 <img src="process_stack.jpeg" alt="process_stack" style="zoom:20%;" />
 
